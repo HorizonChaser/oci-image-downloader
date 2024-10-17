@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -40,12 +41,13 @@ type ManifestList struct {
 			Architecture string `json:"architecture"`
 			Variant      string `json:"variant,omitempty"`
 		} `json:"platform"`
+		Size int `json:"size"`
 	} `json:"manifests"`
 }
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Println("usage: go run main.go <output-dir> <image[:tag][@digest]> ...")
+		fmt.Printf("usage: %s <output-dir> <image[:tag][@digest]> ...", os.Args[0])
 		os.Exit(1)
 	}
 	dir := os.Args[1]
@@ -54,6 +56,17 @@ func main() {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
 		os.Exit(1)
+	}
+
+	blobDir := filepath.Join(dir, "blobs", "sha256")
+	if err := os.MkdirAll(blobDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	err := os.WriteFile(filepath.Join(dir, "oci-layout"), []byte("{\"imageLayoutVersion\": \"1.0.0\"}"), 0644)
+	if err != nil {
+		panic(err)
 	}
 
 	for _, imageTag := range images {
@@ -95,6 +108,13 @@ func processImage(dir, imageTag string) error {
 		return err
 	}
 
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("Manifest JSON string in processImage:")
+	fmt.Println(string(manifestBytes))
+
 	schemaVersion := int(manifest["schemaVersion"].(float64))
 	if schemaVersion == 1 {
 		if err := handleManifestV1(manifest, token, image, dir); err != nil {
@@ -103,6 +123,7 @@ func processImage(dir, imageTag string) error {
 	} else if schemaVersion == 2 {
 		mediaType := manifest["mediaType"].(string)
 		switch mediaType {
+		//for nginx
 		case "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json":
 			if err := handleManifestList(manifest, token, image, dir); err != nil {
 				return err
@@ -196,9 +217,12 @@ func handleManifestV2(manifest map[string]interface{}, token, image, dir string)
 		return err
 	}
 
+	fmt.Println("ManifestV2 in handleManifestV2:")
+	fmt.Println(string(manifestBytes))
+
 	fmt.Printf("Downloading '%s' (%d layers)...\n", image, len(manifestV2.Layers))
 	for _, layer := range manifestV2.Layers {
-		layerPath := filepath.Join(dir, strings.ReplaceAll(layer.Digest, ":", "_")) + ".tar.gz"
+		layerPath := filepath.Join(filepath.Join(dir, "blobs", "sha256"), strings.ReplaceAll(layer.Digest, "sha256:", ""))
 		if err := downloadLayer(token, image, layer.Digest, layerPath); err != nil {
 			return err
 		}
@@ -217,12 +241,21 @@ func handleManifestList(manifest map[string]interface{}, token, image, dir strin
 		return err
 	}
 
+	//fmt.Printf("ManifestList in handleManifestList: %s\n", string(manifestBytes))
+
 	targetArch := os.Getenv("TARGETARCH")
 	if targetArch == "" {
 		targetArch = "amd64"
 	}
 	for _, manifestRef := range manifestList.Manifests {
 		if manifestRef.Platform.Architecture == targetArch {
+			toPrint := fmt.Sprintf("{\"schemaVersion\":2,\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"%s\",\"size\":%d}]}", manifestRef.Digest, manifestRef.Size)
+
+			err = os.WriteFile(filepath.Join(dir, "index.json"), []byte(toPrint), 0644)
+			if err != nil {
+				panic(err)
+			}
+
 			return handleManifestByDigest(token, image, manifestRef.Digest, dir)
 		}
 	}
@@ -239,6 +272,32 @@ func handleManifestByDigest(token, image, digest, dir string) error {
 	if err := manifestJson.Decode(&manifest); err != nil {
 		return err
 	}
+
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("Manifest JSON string in handleManifestByDigest:")
+	fmt.Println(string(manifestBytes))
+
+	//write manifest json to blobs
+	blobDir := filepath.Join(dir, "blobs", "sha256")
+	err = os.WriteFile(filepath.Join(blobDir, strings.ReplaceAll(digest, "sha256:", "")), manifestBytes, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	// 获取 config.digest 的值
+	config, ok := manifest["config"].(map[string]interface{})
+	if !ok {
+		return errors.New("invalid config format")
+	}
+	configDigest, ok := config["digest"].(string)
+	if !ok {
+		return errors.New("invalid digest format")
+	}
+	fmt.Println("Config digest:", configDigest)
+	err = downloadConfig(token, image, configDigest, blobDir)
 
 	mediaType := manifest["mediaType"].(string)
 	switch mediaType {
@@ -280,6 +339,37 @@ func downloadLayer(token, image, digest, layerPath string) error {
 	return nil
 }
 
+func downloadConfig(token, image, digest, blobDir string) error {
+	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", image, digest)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := httpDo(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("failed to download config")
+	}
+
+	file, err := os.Create(path.Join(blobDir, strings.ReplaceAll(digest, "sha256:", "")))
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func httpGet(urlIn string) (*http.Response, error) {
 	client := &http.Client{}
 	if proxyURL := os.Getenv("HTTP_PROXY"); proxyURL != "" {
@@ -293,6 +383,9 @@ func httpGet(urlIn string) (*http.Response, error) {
 }
 
 func httpDo(req *http.Request) (*http.Response, error) {
+
+	fmt.Println("httpDo: req.URL: ", req.URL)
+
 	client := &http.Client{}
 	if proxyURL := os.Getenv("HTTP_PROXY"); proxyURL != "" {
 		proxy, err := url.Parse(proxyURL)
