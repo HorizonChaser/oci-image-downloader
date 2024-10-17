@@ -103,19 +103,11 @@ func processImage(dir, imageTag string) error {
 	} else if schemaVersion == 2 {
 		mediaType := manifest["mediaType"].(string)
 		switch mediaType {
-		case "application/vnd.docker.distribution.manifest.list.v2+json":
+		case "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.oci.image.index.v1+json":
 			if err := handleManifestList(manifest, token, image, dir); err != nil {
 				return err
 			}
-		case "application/vnd.docker.distribution.manifest.v2+json":
-			if err := handleManifestV2(manifest, token, image, dir); err != nil {
-				return err
-			}
-		case "application/vnd.oci.image.index.v1+json":
-			if err := handleManifestList(manifest, token, image, dir); err != nil {
-				return err
-			}
-		case "application/vnd.oci.image.manifest.v1+json":
+		case "application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json":
 			if err := handleManifestV2(manifest, token, image, dir); err != nil {
 				return err
 			}
@@ -231,10 +223,30 @@ func handleManifestList(manifest map[string]interface{}, token, image, dir strin
 	}
 	for _, manifestRef := range manifestList.Manifests {
 		if manifestRef.Platform.Architecture == targetArch {
-			return processImage(dir, fmt.Sprintf("%s@%s", image, manifestRef.Digest))
+			return handleManifestByDigest(token, image, manifestRef.Digest, dir)
 		}
 	}
 	return errors.New("no matching manifest for target architecture")
+}
+
+func handleManifestByDigest(token, image, digest, dir string) error {
+	manifestJson, err := fetchManifest(token, image, digest)
+	if err != nil {
+		return err
+	}
+
+	var manifest map[string]interface{}
+	if err := manifestJson.Decode(&manifest); err != nil {
+		return err
+	}
+
+	mediaType := manifest["mediaType"].(string)
+	switch mediaType {
+	case "application/vnd.docker.distribution.manifest.v2+json", "application/vnd.oci.image.manifest.v1+json":
+		return handleManifestV2(manifest, token, image, dir)
+	default:
+		return errors.New("unsupported manifest media type for digest")
+	}
 }
 
 func downloadLayer(token, image, digest, layerPath string) error {
