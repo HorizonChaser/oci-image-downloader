@@ -1,5 +1,7 @@
 package main
 
+//DONE marshall then unmarshall may cause SHA256 mismatch in manifest
+
 import (
 	"encoding/json"
 	"errors"
@@ -54,13 +56,13 @@ func main() {
 	images := os.Args[2:]
 
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
 		os.Exit(1)
 	}
 
 	blobDir := filepath.Join(dir, "blobs", "sha256")
 	if err := os.MkdirAll(blobDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "error: failed to create directory: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -71,24 +73,25 @@ func main() {
 
 	for _, imageTag := range images {
 		if err := processImage(dir, imageTag); err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to process image %s: %v\n", imageTag, err)
+			_, _ = fmt.Fprintf(os.Stderr, "error: failed to process image %s: %v\n", imageTag, err)
 			os.Exit(1)
 		}
 	}
 
 	fmt.Printf("Download of images into '%s' complete.\n", dir)
-	fmt.Println("Use something like the following to load the result into a Docker daemon:")
-	fmt.Printf("  tar -cC '%s' . | docker load\n", dir)
+	fmt.Println("Use something like the following to load the result into a containerd instance:")
+	fmt.Printf("  tar -cC '%s' . | nerdctl load\n", dir)
 }
 
 func processImage(dir, imageTag string) error {
+	// parse image tag, use latest as default
 	image := strings.Split(imageTag, ":")[0]
 	tag := "latest"
 	if strings.Contains(imageTag, ":") {
 		tag = strings.Split(imageTag, ":")[1]
 	}
 
-	// add prefix library if passed official image
+	// add prefix library if official image has been passed
 	if !strings.Contains(image, "/") {
 		image = "library/" + image
 	}
@@ -108,12 +111,13 @@ func processImage(dir, imageTag string) error {
 		return err
 	}
 
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	fmt.Println("Manifest JSON string in processImage:")
-	fmt.Println(string(manifestBytes))
+	//manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	//if err != nil {
+	//	return err
+	//}
+
+	//fmt.Println("Manifest JSON string in processImage:")
+	//fmt.Println(string(manifestBytes))
 
 	schemaVersion := int(manifest["schemaVersion"].(float64))
 	if schemaVersion == 1 {
@@ -143,12 +147,17 @@ func processImage(dir, imageTag string) error {
 }
 
 func fetchAuthToken(image string) (string, error) {
-	url := fmt.Sprintf("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull", image)
-	resp, err := httpGet(url)
+	pullUrl := fmt.Sprintf("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull", image)
+	resp, err := httpGet(pullUrl)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return "", errors.New("failed to fetch auth token")
@@ -165,8 +174,8 @@ func fetchAuthToken(image string) (string, error) {
 }
 
 func fetchManifest(token, image, tag string) (*json.Decoder, error) {
-	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/manifests/%s", image, tag)
-	req, err := http.NewRequest("GET", url, nil)
+	manifestUrl := fmt.Sprintf("https://registry-1.docker.io/v2/%s/manifests/%s", image, tag)
+	req, err := http.NewRequest("GET", manifestUrl, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +193,28 @@ func fetchManifest(token, image, tag string) (*json.Decoder, error) {
 	}
 
 	return json.NewDecoder(resp.Body), nil
+}
+
+func fetchManifestRaw(token, image, tag string) (io.ReadCloser, error) {
+	manifestUrl := fmt.Sprintf("https://registry-1.docker.io/v2/%s/manifests/%s", image, tag)
+	req, err := http.NewRequest("GET", manifestUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v1+json")
+
+	resp, err := httpDo(req)
+	if err != nil {
+		return nil, err
+	}
+	//defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("failed to fetch manifest")
+	}
+
+	return resp.Body, nil
 }
 
 func handleManifestV1(manifest map[string]interface{}, token, image, dir string) error {
@@ -217,8 +248,8 @@ func handleManifestV2(manifest map[string]interface{}, token, image, dir string)
 		return err
 	}
 
-	fmt.Println("ManifestV2 in handleManifestV2:")
-	fmt.Println(string(manifestBytes))
+	//fmt.Println("ManifestV2 in handleManifestV2:")
+	//fmt.Println(string(manifestBytes))
 
 	fmt.Printf("Downloading '%s' (%d layers)...\n", image, len(manifestV2.Layers))
 	for _, layer := range manifestV2.Layers {
@@ -273,16 +304,18 @@ func handleManifestByDigest(token, image, digest, dir string) error {
 		return err
 	}
 
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	fmt.Println("Manifest JSON string in handleManifestByDigest:")
-	fmt.Println(string(manifestBytes))
+	//manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	//if err != nil {
+	//	return err
+	//}
+	//fmt.Println("Manifest JSON string in handleManifestByDigest:")
+	//fmt.Println(string(manifestBytes))
 
 	//write manifest json to blobs
+	rawManifest, err := fetchManifestRaw(token, image, digest)
+	rawManifestBytes, err := io.ReadAll(rawManifest)
 	blobDir := filepath.Join(dir, "blobs", "sha256")
-	err = os.WriteFile(filepath.Join(blobDir, strings.ReplaceAll(digest, "sha256:", "")), manifestBytes, 0644)
+	err = os.WriteFile(filepath.Join(blobDir, strings.ReplaceAll(digest, "sha256:", "")), rawManifestBytes, 0644)
 	if err != nil {
 		panic(err)
 	}
@@ -309,8 +342,8 @@ func handleManifestByDigest(token, image, digest, dir string) error {
 }
 
 func downloadLayer(token, image, digest, layerPath string) error {
-	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", image, digest)
-	req, err := http.NewRequest("GET", url, nil)
+	layerUrl := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", image, digest)
+	req, err := http.NewRequest("GET", layerUrl, nil)
 	if err != nil {
 		return err
 	}
@@ -320,7 +353,12 @@ func downloadLayer(token, image, digest, layerPath string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return errors.New("failed to download layer")
@@ -330,7 +368,12 @@ func downloadLayer(token, image, digest, layerPath string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(file)
 
 	if _, err := io.Copy(file, resp.Body); err != nil {
 		return err
@@ -340,8 +383,8 @@ func downloadLayer(token, image, digest, layerPath string) error {
 }
 
 func downloadConfig(token, image, digest, blobDir string) error {
-	url := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", image, digest)
-	req, err := http.NewRequest("GET", url, nil)
+	configUrl := fmt.Sprintf("https://registry-1.docker.io/v2/%s/blobs/%s", image, digest)
+	req, err := http.NewRequest("GET", configUrl, nil)
 	if err != nil {
 		return err
 	}
@@ -351,7 +394,12 @@ func downloadConfig(token, image, digest, blobDir string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		return errors.New("failed to download config")
@@ -361,7 +409,12 @@ func downloadConfig(token, image, digest, blobDir string) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			panic(err)
+		}
+	}(file)
 
 	if _, err := io.Copy(file, resp.Body); err != nil {
 		return err
@@ -384,7 +437,7 @@ func httpGet(urlIn string) (*http.Response, error) {
 
 func httpDo(req *http.Request) (*http.Response, error) {
 
-	fmt.Println("httpDo: req.URL: ", req.URL)
+	//fmt.Println("httpDo: req.URL: ", req.URL)
 
 	client := &http.Client{}
 	if proxyURL := os.Getenv("HTTP_PROXY"); proxyURL != "" {
